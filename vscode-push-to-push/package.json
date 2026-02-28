@@ -1,0 +1,64 @@
+{
+    "name": "vscode-push-to-push",
+    "displayName": "Push-to-Push",
+    "description": "Automatically git push your code by physically pushing your laptop backward.",
+    "version": "1.0.0",
+    "publisher": "antigravity",
+    "engines": {
+        "vscode": "^1.90.0"
+    },
+    "categories": [
+        "Other"
+    ],
+    "activationEvents": [],
+    "main": "./out/extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "pushtopush.toggle",
+                "title": "Push-to-Push: Toggle Monitoring"
+            }
+        ],
+        "configuration": {
+            "title": "Push-to-Push",
+            "properties": {
+                "pushtopush.sensitivity": {
+                    "type": "number",
+                    "default": 0.15,
+                    "description": "Depth-change sensitivity. Lower is more sensitive (e.g. 0.08)."
+                },
+                "pushtopush.pollMs": {
+                    "type": "integer",
+                    "default": 2000,
+                    "description": "Milliseconds between depth samples (frame capture rate)."
+                },
+                "pushtopush.cameraIndex": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "Webcam device index (typically 0 for built-in)."
+                },
+                "pushtopush.pythonPath": {
+                    "type": "string",
+                    "default": "python",
+                    "description": "Path to the Python executable."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "pretest": "npm run compile && npm run lint",
+        "lint": "eslint src --ext ts",
+        "test": "node ./out/test/runTest.js"
+    },
+    "devDependencies": {
+        "@types/vscode": "^1.90.0",
+        "@types/node": "20.x",
+        "typescript": "^5.4.5",
+        "eslint": "^8.57.0",
+        "@typescript-eslint/eslint-plugin": "^7.11.0",
+        "@typescript-eslint/parser": "^7.11.0"
+    }
+}
