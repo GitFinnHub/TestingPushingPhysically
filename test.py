@@ -1,31 +1,31 @@
 """
-push-to-push 🚀
-───────────────────────────────────────────────────
-Physically push your laptop → automatically push your code to GitHub.
+push-to-push
+---------------------------------------------------
+Physically push your laptop BACKWARD -> automatically push your code to GitHub.
 
-Detection strategy (tried in order):
-  1. Windows built-in accelerometer (via Windows Sensor API / comtypes)
-  2. Mouse-jitter fallback  — rapid involuntary cursor movement that
-     occurs when you physically bump a laptop.
+Detection strategy:
+  DepthAnything V2 (via Hugging Face transformers) - estimates depth from the
+  built-in webcam every few seconds. When the scene suddenly gets farther
+  away (average depth jumps), it means the camera moved backward -> git push!
 
 Usage:
-    python push_to_push.py --repo "C:/path/to/your/repo"
-    python push_to_push.py --repo . --branch main --message "bump push"
-    python push_to_push.py --demo          # shake simulation for testing
+    python test.py --repo "C:/path/to/your/repo"
+    python test.py --repo . --branch main --sensitivity 0.12
+    python test.py --demo          # simulates a push without moving
 """
 
 import argparse
-from typing import Union
+from typing import Union, Any, cast
 import time
 import threading
 import subprocess
 import math
-import ctypes
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 
-# ── optional deps ──────────────────────────────────────────────────────────────
+# --- optional deps --------------------------------------------------------------
 try:
     import git  # type: ignore[import-untyped]
     GITPYTHON_AVAILABLE = True
@@ -33,23 +33,42 @@ except ImportError:
     GITPYTHON_AVAILABLE = False
 
 try:
-    import comtypes.client as cc  # type: ignore[import-untyped]
-    import comtypes  # type: ignore[import-untyped]
-    COMTYPES_AVAILABLE = True
+    import cv2  # type: ignore[import-untyped]
+    OPENCV_AVAILABLE = True
 except ImportError:
-    cc = None
-    comtypes = None
-    COMTYPES_AVAILABLE = False
+    cv2 = None
+    OPENCV_AVAILABLE = False
 
 try:
-    import ctypes.wintypes
-    import ctypes
-    CTYPES_AVAILABLE = True
+    import torch  # type: ignore[import-untyped]
+    TORCH_AVAILABLE = True
 except ImportError:
-    CTYPES_AVAILABLE = False
+    torch = None
+    TORCH_AVAILABLE = False
+
+try:
+    from PIL import Image  # type: ignore[import-untyped]
+    PIL_AVAILABLE = True
+except ImportError:
+    Image = None
+    PIL_AVAILABLE = False
+
+try:
+    from transformers import pipeline as hf_pipeline  # type: ignore[import-untyped]
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    hf_pipeline = None
+    TRANSFORMERS_AVAILABLE = False
+
+try:
+    import numpy as np  # type: ignore[import-untyped]
+    NUMPY_AVAILABLE = True
+except ImportError:
+    np = None
+    NUMPY_AVAILABLE = False
 
 
-# ── logging setup ──────────────────────────────────────────────────────────────
+# --- logging setup --------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -58,17 +77,17 @@ logging.basicConfig(
 log = logging.getLogger("push-to-push")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  GIT OPERATIONS
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def git_push(repo_path: Union[str, Path], branch: str, commit_message: str) -> bool:
-    """Stage all changes, commit, and push.  Returns True on success."""
+    """Stage all changes, commit, and push. Returns True on success."""
     resolved: Path = Path(repo_path).resolve()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     full_message = f"{commit_message} [{timestamp}]"
 
-    log.info("📦 Staging changes in %s …", resolved)
+    log.info("[GIT] Staging changes in %s ...", resolved)
 
     if GITPYTHON_AVAILABLE:
         return _git_push_gitpython(resolved, branch, full_message)
@@ -80,30 +99,28 @@ def _git_push_gitpython(repo_path: Path, branch: str, message: str) -> bool:
     try:
         repo = git.Repo(repo_path)  # type: ignore[union-attr]
 
-        # Stage all changes
         repo.git.add("--all")
 
-        # Nothing to commit?
         if not repo.is_dirty(index=True, working_tree=True, untracked_files=True):
-            log.info("✅ Nothing new to commit — already up to date.")
+            log.info("[OK] Nothing new to commit - already up to date.")
             return True
 
         repo.index.commit(message)
-        log.info("✅ Committed: %s", message)
+        log.info("[OK] Committed: %s", message)
 
         origin = repo.remote(name="origin")
         origin.push(refspec=f"{branch}:{branch}")
-        log.info("🚀 Pushed to origin/%s", branch)
+        log.info("[PUSH] Pushed to origin/%s", branch)
         return True
 
     except git.InvalidGitRepositoryError:  # type: ignore[union-attr]
-        log.error("❌ Not a git repository: %s", repo_path)
+        log.error("[ERROR] Not a git repository: %s", repo_path)
         return False
     except git.GitCommandError as exc:  # type: ignore[union-attr]
-        log.error("❌ Git error: %s", exc)
+        log.error("[ERROR] Git error: %s", exc)
         return False
     except Exception as exc:
-        log.error("❌ Unexpected error: %s", exc)
+        log.error("[ERROR] Unexpected error: %s", exc)
         return False
 
 
@@ -113,133 +130,264 @@ def _git_push_subprocess(repo_path: Path, branch: str, message: str) -> bool:
             cmd, cwd=repo_path, capture_output=True, text=True, shell=True
         )
         if result.returncode != 0:
-            log.error("❌ %s\n%s", " ".join(cmd), result.stderr.strip())
+            log.error("[ERROR] %s\n%s", " ".join(cmd), result.stderr.strip())
             return False
         return True
 
     if not run(["git", "add", "--all"]):
         return False
 
-    # Check if there's anything to commit
     status = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=repo_path, capture_output=True, text=True, shell=True
     )
     if not status.stdout.strip():
-        log.info("✅ Nothing new to commit — already up to date.")
+        log.info("[OK] Nothing new to commit - already up to date.")
         return True
 
     if not run(["git", "commit", "-m", message]):
         return False
-    log.info("✅ Committed: %s", message)
+    log.info("[OK] Committed: %s", message)
 
     if not run(["git", "push", "origin", branch]):
         return False
-    log.info("🚀 Pushed to origin/%s", branch)
+    log.info("[PUSH] Pushed to origin/%s", branch)
     return True
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MOTION DETECTION — Windows Sensor API (accelerometer)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+#  MOTION DETECTION - Depth-Anything V2 webcam detector
+# ==============================================================================
 
-# Sensor GUID & interface constants from Windows Sensor SDK
-SENSOR_TYPE_ACCELEROMETER_3D = "{C2FB0F5F-E2D2-4C78-BCD0-352A9582819D}"
+DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
 
-class AccelerometerSensor:
-    """Reads 3-axis G-force from the Windows built-in accelerometer."""
+class DepthCameraDetector:
+    """
+    Detects backward movement of the laptop by watching how the scene depth
+    changes over time using DepthAnything V2.
 
-    def __init__(self):
+    Algorithm
+    ---------
+    1. Capture a webcam frame every `poll_ms` ms.
+    2. Run DepthAnything V2 to get a depth map (higher value = farther away).
+    3. Compute the mean depth of the central 50% crop.
+    4. Maintain an exponential moving average (EMA) as a rolling baseline.
+    5. If `current_mean > ema_baseline + sensitivity`, fire a push event.
+
+    Parameters
+    ----------
+    sensitivity  : depth-unit delta required to trigger (default 0.15).
+                   Lower -> more sensitive. Typical range 0.08 - 0.30.
+    camera_index : which webcam to use (0 = built-in default).
+    ema_alpha    : EMA smoothing factor (0 < alpha < 1).
+    """
+
+    def __init__(
+        self,
+        sensitivity: float = 0.15,
+        camera_index: int = 0,
+        ema_alpha: float = 0.3,
+    ):
+        self.sensitivity = sensitivity
+        self.camera_index = camera_index
+        self.ema_alpha = ema_alpha
+
         self._available = False
-        self._sensor = None
-        if COMTYPES_AVAILABLE:
-            self._init()
+        self._depth_pipe: Any = None
+        self._cap: Any = None
+        self._baseline: Union[float, None] = None  # EMA baseline
 
-    def _init(self):
-        try:
-            sensor_manager = cc.CreateObject(  # type: ignore[union-attr]
-                "{77A1C827-FCD2-4689-8915-9D613CC5FA3E}",
-                interface=comtypes.IUnknown,  # type: ignore[union-attr]
+        self._check_deps()
+
+    # --- dependency check -----------------------------------------------------
+
+    def _check_deps(self):
+        missing = []
+        if not OPENCV_AVAILABLE:
+            missing.append("opencv-python")
+        if not TORCH_AVAILABLE:
+            missing.append("torch")
+        if not PIL_AVAILABLE:
+            missing.append("Pillow")
+        if not TRANSFORMERS_AVAILABLE:
+            missing.append("transformers")
+        if not NUMPY_AVAILABLE:
+            missing.append("numpy")
+
+        if missing:
+            log.error(
+                "[ERROR] Missing packages for webcam depth detection: %s\n"
+                "   Run: python -m pip install %s",
+                ", ".join(missing),
+                " ".join(missing),
             )
-            self._available = False
-        except Exception:
-            self._available = False
+            return
+
+        self._available = True
+
+    # --- public interface -----------------------------------------------------
 
     @property
-    def available(self):
+    def available(self) -> bool:
         return self._available
 
-    def read(self):
-        """Returns (x, y, z) in g-units or None."""
-        return None
+    def start(self):
+        """Open webcam and load model. Call once before the loop."""
+        if not self._available:
+            return
 
+        # Open webcam
+        log.info("[CAM] Opening webcam (index %d) ...", self.camera_index)
+        local_cv2 = cast(Any, cv2)
+        if local_cv2 is None:
+            log.error("[ERROR] OpenCV is not available.")
+            self._available = False
+            return
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MOTION DETECTION — Mouse-jitter fallback
-# ══════════════════════════════════════════════════════════════════════════════
+        self._cap = local_cv2.VideoCapture(self.camera_index)
+        cap = self._cap
+        if cap is None or not cap.isOpened():
+            log.error(
+                "[ERROR] Cannot open webcam %d. Check that no other app is using it.",
+                self.camera_index,
+            )
+            self._available = False
+            return
+        log.info("[CAM] Webcam opened on index %d", self.camera_index)
 
-class MouseJitterDetector:
-    """
-    Detects physical bumps by monitoring the mouse cursor for rapid,
-    involuntary displacement that happens when the laptop is shaken/pushed.
+        # Load depth model
+        log.info("[AI] Loading DepthAnything V2 model (%s) ...", DEPTH_MODEL_ID)
+        log.info("   (First run downloads ~100 MB to the HuggingFace cache.)")
+        try:
+            local_torch = torch
+            device = 0 if (TORCH_AVAILABLE and local_torch is not None and local_torch.cuda.is_available()) else -1
+            
+            local_hf_pipeline = hf_pipeline
+            if local_hf_pipeline is None:
+                log.error("[ERROR] HuggingFace transformers pipeline is not available.")
+                self._available = False
+                return
+            
+            self._depth_pipe = local_hf_pipeline(
+                task="depth-estimation",
+                model=DEPTH_MODEL_ID,
+                device=device,
+            )
+            log.info("[AI] Depth model loaded (%s) [device=%s]",
+                     DEPTH_MODEL_ID, "GPU" if device == 0 else "CPU")
+        except Exception as exc:
+            log.error("[ERROR] Failed to load depth model: %s", exc)
+            self._available = False
 
-    Works on any Windows machine without extra hardware.
-    """
-
-    def __init__(self, threshold_px: int = 40, window_ms: int = 200, hits: int = 3):
-        """
-        threshold_px : minimum cursor displacement (pixels) per sample to count as jitter
-        window_ms    : sample interval
-        hits         : how many consecutive jitter samples trigger a "shake"
-        """
-        self.threshold_px = threshold_px
-        self.window_ms = window_ms
-        self.hits = hits
-        self._last_pos = self._get_cursor()
-        self._jitter_streak = 0
-
-    @staticmethod
-    def _get_cursor():
-        class POINT(ctypes.Structure):
-            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-        pt = POINT()
-        windll = getattr(ctypes, "windll", None)
-        if windll:
-            windll.user32.GetCursorPos(ctypes.byref(pt))
-        return pt.x, pt.y
+    def stop(self):
+        """Release webcam resources."""
+        if self._cap is not None and self._cap.isOpened():
+            self._cap.release()
 
     def check(self) -> bool:
-        """Returns True if a shake/push event is detected."""
-        x, y = self._get_cursor()
-        lx, ly = self._last_pos
-        delta = math.hypot(x - lx, y - ly)
-        self._last_pos = (x, y)
+        """
+        Grab one frame, run depth estimation, compare to EMA baseline.
+        Returns True if a backward-push is detected.
+        """
+        if not self._available or self._cap is None or self._depth_pipe is None:
+            return False
 
-        if delta >= self.threshold_px:
-            self._jitter_streak += 1
-        else:
-            self._jitter_streak = max(0, self._jitter_streak - 1)
+        # Read frame
+        cap = cast(Any, self._cap)
+        ret, frame_bgr = cap.read()
+        if not ret or frame_bgr is None:
+            log.warning("[WARN] Webcam read failed - skipping frame.")
+            return False
 
-        if self._jitter_streak >= self.hits:
-            self._jitter_streak = 0
+        # Convert BGR -> PIL RGB for the HF pipeline
+        local_cv2 = cast(Any, cv2)
+        local_image = cast(Any, Image)
+        if local_cv2 is None or local_image is None:
+            log.warning("[WARN] OpenCV or Pillow not available for image conversion.")
+            # This should technically be caught by self._available, but helps lints
+            return False
+            
+        frame_rgb = local_cv2.cvtColor(frame_bgr, local_cv2.COLOR_BGR2RGB)
+        pil_img = local_image.fromarray(frame_rgb)
+
+        # Run depth estimation
+        try:
+            pipe = self._depth_pipe
+            assert pipe is not None
+            result = pipe(pil_img)
+            depth_tensor = result["depth"]  # PIL Image or numpy
+        except Exception as exc:
+            log.warning("[WARN] Depth inference failed: %s", exc)
+            return False
+
+        # Convert depth to numpy array
+        local_np = cast(Any, np)
+        if not NUMPY_AVAILABLE or local_np is None:
+            log.warning("[WARN] NumPy not available for depth processing.")
+            return False
+            
+        try:
+            depth_np = local_np.array(depth_tensor, dtype=float)
+        except Exception:
+            log.warning("[WARN] Failed to convert depth tensor to numpy array.")
+            return False
+
+        # Normalise to [0, 1] range so sensitivity is model-agnostic
+        d_min, d_max = depth_np.min(), depth_np.max()
+        if d_max - d_min < 1e-6:
+            log.debug("[DEPTH] Flat depth map - skipping frame.")
+            return False  # flat depth map - boring frame, skip
+        depth_norm = (depth_np - d_min) / (d_max - d_min)
+
+        # Centre-crop (middle 50% height x 50% width)
+        h, w = depth_norm.shape
+        cy, cx = h // 2, w // 2
+        crop = depth_norm[cy // 2: cy + cy // 2, cx // 2: cx + cx // 2]
+        current_mean = float(crop.mean())
+
+        log.debug("[DEPTH] mean=%.4f baseline=%.4f", current_mean,
+                  self._baseline if self._baseline is not None else 0)
+
+        # Initialise EMA baseline on first good frame
+        if self._baseline is None:
+            self._baseline = current_mean
+            log.info("[DEPTH] Baseline initialised at %.4f", self._baseline)
+            return False
+
+        # EMA update - adapts slowly to gradual lighting / position changes
+        prev_baseline = cast(float, self._baseline) # Type assertion
+        self._baseline = (
+            self.ema_alpha * current_mean + (1 - self.ema_alpha) * prev_baseline
+        )
+
+        # Fire if depth jumped sharply above the old baseline
+        delta = current_mean - prev_baseline
+        if delta > self.sensitivity:
+            log.info(
+                "[EVENT] Depth spike! mean=%.4f baseline=%.4f delta=+%.4f (threshold %.4f)",
+                current_mean, prev_baseline, delta, self.sensitivity,
+            )
+            # Reset baseline so we don't retrigger immediately
+            self._baseline = current_mean
             return True
+
         return False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  MAIN WATCHER LOOP
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 class PushToPush:
     def __init__(
         self,
         repo_path: str,
         branch: str = "main",
-        commit_message: str = "🤜 pushed by physical push",
+        commit_message: str = "pushed by physical push",
         cooldown_seconds: int = 30,
-        poll_ms: int = 150,
-        shake_threshold_px: int = 40,
-        shake_hits: int = 3,
+        poll_ms: int = 2000,
+        sensitivity: float = 0.15,
+        camera_index: int = 0,
     ):
         self.repo_path = repo_path
         self.branch = branch
@@ -250,68 +398,66 @@ class PushToPush:
         self._last_push_time = 0.0
         self._lock = threading.Lock()
 
-        # Try accelerometer first, fall back to mouse jitter
-        self._accel = AccelerometerSensor()
-        self._jitter = MouseJitterDetector(
-            threshold_px=shake_threshold_px, hits=shake_hits
+        self._detector = DepthCameraDetector(
+            sensitivity=sensitivity,
+            camera_index=camera_index,
         )
-
-        if self._accel.available:
-            log.info("🔬 Using Windows accelerometer sensor.")
-        else:
-            log.info(
-                "🖱️  Accelerometer not available — using mouse-jitter detection.\n"
-                "   (Physically pushing the laptop will jiggle the cursor slightly.)"
-            )
 
     def _on_push_detected(self):
         now = time.time()
         with self._lock:
             if now - self._last_push_time < self.cooldown:
                 remaining = int(self.cooldown - (now - self._last_push_time))
-                log.info("🕐 Push detected but cooling down (%ds left).", remaining)
+                log.info("[INFO] Push detected but cooling down (%ds left).", remaining)
                 return
             self._last_push_time = now
 
-        log.info("💥 PUSH DETECTED — running git push …")
+        log.info("[EVENT] PUSH DETECTED -- running git push ...")
         success = git_push(self.repo_path, self.branch, self.commit_message)
         if success:
-            _notify("push-to-push", "🚀 Code pushed to GitHub!")
+            _notify("push-to-push", "Code pushed to GitHub!")
         else:
-            _notify("push-to-push", "❌ Git push failed. Check the logs.")
+            _notify("push-to-push", "Git push failed. Check the logs.")
 
     def run(self):
-        log.info("👂 Listening for physical pushes … (Ctrl+C to stop)")
-        log.info("   Repo   : %s", Path(self.repo_path).resolve())
-        log.info("   Branch : %s", self.branch)
-        log.info("   Cooldown: %ds", self.cooldown)
+        if not self._detector.available:
+            log.error("[ERROR] Depth detector unavailable. Install missing packages and retry.")
+            return
+
+        self._detector.start()
+
+        if not self._detector.available:
+            return  # start() flagged a problem
+
+        log.info("[INFO] Listening for physical pushes ... (Ctrl+C to stop)")
+        log.info("   Repo        : %s", Path(self.repo_path).resolve())
+        log.info("   Branch      : %s", self.branch)
+        log.info("   Cooldown    : %ds", self.cooldown)
+        log.info("   Sensitivity : %.2f depth units", self._detector.sensitivity)
+        log.info("   Poll        : %d ms", self.poll_ms)
+        log.info("")
+        log.info("   -> Push the laptop BACKWARD to trigger a git push!")
 
         try:
             while True:
-                detected = False
-
-                if self._accel.available:
-                    reading = self._accel.read()
-                    if reading:
-                        x, y, z = reading
-                        magnitude = math.sqrt(x**2 + y**2 + z**2)
-                        detected = abs(magnitude - 1.0) > 0.5   # > 0.5g deviation
-                else:
-                    detected = self._jitter.check()
+                detected = self._detector.check()
 
                 if detected:
-                    # Run push in background so we don't stall the detector
-                    threading.Thread(target=self._on_push_detected, daemon=True).start()
+                    threading.Thread(
+                        target=self._on_push_detected, daemon=True
+                    ).start()
 
                 time.sleep(self.poll_ms / 1000)
 
         except KeyboardInterrupt:
-            log.info("👋 Stopped.")
+            log.info("[INFO] Stopped.")
+        finally:
+            self._detector.stop()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  DESKTOP NOTIFICATION (best-effort)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def _notify(title: str, message: str):
     try:
@@ -321,40 +467,41 @@ def _notify(title: str, message: str):
         pass   # notifications are optional
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  DEMO / SHAKE SIMULATION
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def run_demo(repo_path: str, branch: str, message: str):
     """Simulate a push event after 3 seconds without needing physical movement."""
-    log.info("🎬 Demo mode — simulating a physical push in 3 seconds …")
+    log.info("[DEMO] Demo mode - simulating a physical push in 3 seconds ...")
 
     watcher = PushToPush(repo_path, branch, message, cooldown_seconds=5)
 
-    def fake_shake():
+    def fake_push():
         time.sleep(3)
-        log.info("💥 [DEMO] Simulating shake!")
+        log.info("[DEMO] Simulating backward push!")
         watcher._on_push_detected()
 
-    t = threading.Thread(target=fake_shake, daemon=True)
+    t = threading.Thread(target=fake_push, daemon=True)
     t.start()
-    t.join(timeout=15)
-    log.info("✅ Demo complete.")
+    t.join(timeout=30)
+    log.info("[OK] Demo complete.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  CLI ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def main():
     _epilog = (
         "Examples:\n"
-        "  python push_to_push.py --repo C:/my/project\n"
-        "  python push_to_push.py --repo . --branch dev --threshold 25\n"
-        "  python push_to_push.py --demo\n"
+        "  python test.py --repo C:/my/project\n"
+        "  python test.py --repo . --branch dev --sensitivity 0.10\n"
+        "  python test.py --repo . --camera 1    # use external webcam\n"
+        "  python test.py --demo\n"
     )
     parser = argparse.ArgumentParser(
-        description="push-to-push 🚀 — physically push your laptop to git push",
+        description="push-to-push - physically push your laptop BACKWARD to git push",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_epilog,
     )
@@ -370,7 +517,7 @@ def main():
     )
     parser.add_argument(
         "--message", "-m",
-        default="🤜 pushed by physical push",
+        default="pushed by physical push",
         help="Commit message template",
     )
     parser.add_argument(
@@ -379,9 +526,23 @@ def main():
         help="Seconds to wait between pushes (default: 30)",
     )
     parser.add_argument(
-        "--threshold", "-t",
-        type=int, default=40,
-        help="Mouse jitter threshold in pixels (default: 40; lower = more sensitive)",
+        "--sensitivity", "-s",
+        type=float, default=0.15,
+        help=(
+            "Depth-change sensitivity (default: 0.15).  "
+            "Lower = more sensitive (e.g. 0.08).  "
+            "Higher = requires a bigger push (e.g. 0.30)."
+        ),
+    )
+    parser.add_argument(
+        "--camera",
+        type=int, default=0,
+        help="Webcam device index (default: 0 = built-in camera)",
+    )
+    parser.add_argument(
+        "--poll",
+        type=int, default=2000,
+        help="Milliseconds between depth samples (default: 2000 ms)",
     )
     parser.add_argument(
         "--demo",
@@ -389,7 +550,10 @@ def main():
         help="Simulate a push event without physical movement (for testing)",
     )
 
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        return
 
     if args.demo:
         run_demo(args.repo, args.branch, args.message)
@@ -399,7 +563,9 @@ def main():
             branch=args.branch,
             commit_message=args.message,
             cooldown_seconds=args.cooldown,
-            shake_threshold_px=args.threshold,
+            sensitivity=args.sensitivity,
+            camera_index=args.camera,
+            poll_ms=args.poll,
         )
         watcher.run()
 
